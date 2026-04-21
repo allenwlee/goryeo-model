@@ -1,0 +1,32 @@
+# Model weights — upload to HF separately
+model/*.safetensors
+model/*.bin
+model/*.pt
+model/*.ckpt
+model/*.pth
+model/*.onnx
+model/.gitkeep
+
+# Training outputs
+results/*
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Environment
+.env
+.venv/
+venv/
+env/
+
+# OS
+.DS_Store
+Thumbs.db
