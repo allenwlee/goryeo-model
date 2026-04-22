@@ -29,6 +29,14 @@ def detect_encoding(html_bytes: bytes) -> str:
     return 'utf-8'  # Last resort
 
 
+def _parse_with_builder(html_bytes: bytes, encoding: str) -> BeautifulSoup:
+    """Try lxml first, fall back to html.parser if lxml is unavailable."""
+    try:
+        return BeautifulSoup(html_bytes, 'lxml', from_encoding=encoding)
+    except Exception:
+        return BeautifulSoup(html_bytes, 'html.parser', from_encoding=encoding)
+
+
 def parse_html(html_bytes: bytes, encoding: Optional[str] = None) -> BeautifulSoup:
     """
     Parse HTML bytes using BeautifulSoup.
@@ -36,7 +44,7 @@ def parse_html(html_bytes: bytes, encoding: Optional[str] = None) -> BeautifulSo
     """
     if encoding is None:
         encoding = detect_encoding(html_bytes)
-    return BeautifulSoup(html_bytes, 'lxml', from_encoding=encoding)
+    return _parse_with_builder(html_bytes, encoding)
 
 
 def parse_html_with_fallback(html_bytes: bytes) -> BeautifulSoup:
@@ -47,18 +55,18 @@ def parse_html_with_fallback(html_bytes: bytes) -> BeautifulSoup:
     # Try detected encoding first
     enc = detect_encoding(html_bytes)
     try:
-        return BeautifulSoup(html_bytes, 'lxml', from_encoding=enc)
+        return _parse_with_builder(html_bytes, enc)
     except (UnicodeDecodeError, LookupError):
         pass
 
     for enc in ENCODING_FALLBACK_CHAIN:
         try:
-            return BeautifulSoup(html_bytes, 'lxml', from_encoding=enc)
+            return _parse_with_builder(html_bytes, enc)
         except (UnicodeDecodeError, LookupError):
             continue
 
-    # Absolute last resort: decode with errors='replace' and parse as utf-8
-    return BeautifulSoup(html_bytes.decode('utf-8', errors='replace'), 'lxml')
+    # Absolute last resort: decode with errors='replace' and parse
+    return _parse_with_builder(html_bytes.decode('utf-8', errors='replace').encode('utf-8'), 'utf-8')
 
 
 def extract_text(soup: BeautifulSoup, strip: bool = True) -> str:
