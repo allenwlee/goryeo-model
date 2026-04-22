@@ -8,7 +8,7 @@ import asyncio
 import json
 import logging
 import sys
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 from framework.fetcher import Fetcher
@@ -61,7 +61,7 @@ class CrawlerState:
             'completed': list(self.completed),
             'skipped': list(self.skipped),
             'failed': self.failed,
-            'saved_at': datetime.utcnow().isoformat(),
+            'saved_at': datetime.now(timezone.utc).isoformat(),
         }, indent=2))
 
     def mark_completed(self, task_id: str):
@@ -103,7 +103,25 @@ async def run_all(dry_run: bool = False, resume: bool = True):
     from framework.errors import CrawlError
 
     state_file = Path(__file__).parent.parent / 'crawler_state.json'
-    state = CrawlerState(state_file) if resume else CrawlerState.__new__(CrawlerState)
+    if resume:
+        state = CrawlerState(state_file)
+    else:
+        # Fresh state with no completed/skipped/failed records
+        class FreshState:
+            def __init__(self, sf):
+                self.state_file = sf
+                self.completed = set()
+                self.skipped = set()
+                self.failed = {}
+            def save(self):
+                pass  # No-op when resume=False
+            def mark_completed(self, k):
+                pass
+            def mark_skipped(self, k):
+                pass
+            def mark_failed(self, k, r):
+                pass
+        state = FreshState(state_file)
 
     fetcher = Fetcher()
     robots_checker = RobotsChecker(fetcher)
@@ -117,7 +135,14 @@ async def run_all(dry_run: bool = False, resume: bool = True):
             results.append((task_id, source_name, 'completed'))
             continue
 
-        result = await run_task(task_id, source_name, module_path, dry_run)
+        try:
+            result = await run_task(task_id, source_name, module_path, dry_run)
+        except Exception as e:
+            log.error(f"Task {task_id} ({source_name}) raised: {type(e).__name__}: {e}")
+            state.mark_failed(task_key, f"{type(e).__name__}: {e}")
+            results.append((task_id, source_name, 'failed'))
+            continue
+
         if result is True:
             state.mark_completed(task_key)
             results.append((task_id, source_name, 'success'))
@@ -137,14 +162,14 @@ def main():
     parser.add_argument('--no-resume', action='store_true', help='Ignore saved state, run all tasks')
     args = parser.parse_args()
 
-    log.info(f"Starting crawler at {datetime.utcnow().isoformat()}")
+    log.info(f"Starting crawler at {datetime.now(timezone.utc).isoformat()}")
     results = asyncio.run(run_all(dry_run=args.dry_run, resume=not args.no_resume))
 
     log.info("=== Crawler Summary ===")
     for task_id, source_name, status in results:
         log.info(f"  Task {task_id} ({source_name}): {status}")
 
-    log.info(f"Finished at {datetime.utcnow().isoformat()}")
+    log.info(f"Finished at {datetime.now(timezone.utc).isoformat()}")
 
 
 if __name__ == '__main__':

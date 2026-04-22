@@ -17,7 +17,7 @@ from framework.robots import RobotsChecker, is_blocked
 
 log = logging.getLogger('sources.jkaa')
 
-OUTPUT_DIR = Path(__file__).parent.parent.parent / 'train_data' / 'text_corpus' / 'jkaa_articles'
+OUTPUT_DIR = Path(__file__).resolve().parent.parent.parent.parent / 'train_data' / 'text_corpus' / 'jkaa_articles'
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 # Known JKAA costume article URLs from research report

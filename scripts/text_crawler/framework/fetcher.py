@@ -65,7 +65,7 @@ class Fetcher:
                             details={'url': url, 'status_code': response.status_code},
                         )
                     return response
-            except httpx.Timeout as e:
+            except httpx.TimeoutException as e:
                 if attempt < self.max_retries - 1:
                     await asyncio.sleep(2 ** attempt)
                     continue

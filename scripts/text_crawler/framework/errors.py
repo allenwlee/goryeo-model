@@ -10,7 +10,7 @@ CrawlErrorCode: TypeAlias = Literal[
 ]
 
 
-class CrawlError:
+class CrawlError(Exception):
     code: str
     message: str
     retryable: bool

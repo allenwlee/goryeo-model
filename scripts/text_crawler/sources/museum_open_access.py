@@ -13,10 +13,11 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from framework.fetcher import Fetcher
 from framework.storage import build_frontmatter, save_json_corpus_item
 from framework.errors import CrawlError
+from framework.parser import parse_html_with_fallback
 
 log = logging.getLogger('sources.museum_open_access')
 
-OUTPUT_DIR = Path(__file__).parent.parent.parent / 'train_data' / 'text_corpus' / 'museum_open_access'
+OUTPUT_DIR = Path(__file__).resolve().parent.parent.parent.parent / 'train_data' / 'text_corpus' / 'museum_open_access'
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 # Per-museum subdirs
@@ -110,11 +111,15 @@ async def crawl_cleveland(fetcher: Fetcher, save_dir: Path):
     log.info("Starting Cleveland Museum crawl")
     save_dir.mkdir(parents=True, exist_ok=True)
 
-    search_url = 'https://api.clevelandart.org/api/v1/artworks'
-    params = {'query': 'Goryeo', 'has_image': 'true'}
-    data = await fetcher.get_json(search_url, params=params)
-    artworks = data.get('data', [])
-    log.info(f"Cleveland search returned {len(artworks)} results")
+    try:
+        search_url = 'https://openaccess-api.clevelandart.org/api/v1/artworks'
+        params = {'query': 'Goryeo', 'has_image': 'true'}
+        data = await fetcher.get_json(search_url, params=params)
+        artworks = data.get('data', [])
+        log.info(f"Cleveland search returned {len(artworks)} results")
+    except Exception as e:
+        log.warning(f"Cleveland API failed: {e} — skipping Cleveland crawl")
+        return
 
     downloaded = 0
     for artwork in artworks:
@@ -162,21 +167,70 @@ async def crawl_cleveland(fetcher: Fetcher, save_dir: Path):
 
 
 async def crawl_smithsonian(fetcher: Fetcher, save_dir: Path):
-    """Crawl Smithsonian NMAA for Goryeo Korean art."""
+    """Crawl Smithsonian NMAA for Goryeo Korean art via web scraping.
+
+    Note: Smithsonian API (api.si.edu/api/collections/search) may require auth
+    or be deprecated. Falling back to scraping the collections.si.edu search page.
+    If that also fails, log a warning and skip gracefully.
+    """
     log.info("Starting Smithsonian NMAA crawl")
     save_dir.mkdir(parents=True, exist_ok=True)
 
-    search_url = 'https://api.si.edu/api/collections/search'
-    params = {'q': 'Goryeo', 'color': 'includes'}
-    data = await fetcher.get_json(search_url, params=params)
-    response = data.get('response', {})
-    num_results = response.get('numResults', 0)
-    log.info(f"Smithsonian search returned {num_results} results")
+    # Try Smithsonian collections web search (public, no API key needed)
+    try:
+        search_url = 'https://collections.si.edu/search?q=Goryeo+Korean&searchField=all'
+        response = await fetcher.get(search_url)
+        soup = parse_html_with_fallback(response.content)
+        # Find result items
+        items = soup.find_all('div', class_='qanda-item')
+        log.info(f"Smithsonian web search returned {len(items)} items")
+
+        downloaded = 0
+        for item in items[:30]:  # Limit to 30 items
+            try:
+                link = item.find('a')
+                if not link:
+                    continue
+                detail_url = link.get('href', '')
+                if not detail_url.startswith('http'):
+                    detail_url = 'https://collections.si.edu' + detail_url
+
+                # Get detail page
+                detail_resp = await fetcher.get(detail_url)
+                detail_soup = parse_html_with_fallback(detail_resp.content)
+
+                # Extract image
+                img_tag = detail_soup.find('img', class_='viewport-image')
+                img_url = img_tag.get('src', '') if img_tag else ''
+
+                title_elem = detail_soup.find('h1') or detail_soup.find('h2')
+                title = title_elem.get_text(strip=True) if title_elem else ''
+
+                if img_url:
+                    img_bytes = await fetcher.get_binary(img_url)
+                    filename = f"smithsonian_{hash(detail_url)}"
+                    ext = img_url.split('.')[-1].split('?')[0][:4]
+                    if not ext.isalnum():
+                        ext = 'jpg'
+                    img_path = save_dir / f"{filename}.{ext}"
+                    img_path.write_bytes(img_bytes)
+                    downloaded += 1
+            except Exception as e:
+                log.warning(f"Smithsonian item error: {e}")
+                continue
+
+        log.info(f"Smithsonian crawl done: {downloaded} saved")
+        return
+
+    except Exception as e:
+        log.warning(f"Smithsonian web search failed: {e} — skipping Smithsonian crawl")
+        return
 
     downloaded = 0
     skipped_rights = 0
 
-    for row in response.get('rows', []):
+    # Old API-based approach (kept as fallback reference)
+    for row in []:
         content = row.get('content', {})
         descriptive = content.get('descriptiveNonRepeating', {})
         obj_id = descriptive.get('unit_code', '') + '_' + str(row.get('id', ''))
@@ -236,11 +290,15 @@ async def crawl_smithsonian(fetcher: Fetcher, save_dir: Path):
 async def crawl():
     """Run all three museum crawlers."""
     fetcher = Fetcher(requests_per_second=1.0)
-    await asyncio.gather(
+    results = await asyncio.gather(
         crawl_met(fetcher, MET_DIR),
         crawl_cleveland(fetcher, CLEVE_DIR),
         crawl_smithsonian(fetcher, SMITH_DIR),
+        return_exceptions=True,
     )
+    for r in results:
+        if isinstance(r, Exception):
+            log.error(f"Museum crawler exception: {r}")
     log.info("Museum open access crawl complete")
 
 

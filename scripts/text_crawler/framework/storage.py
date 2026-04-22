@@ -33,8 +33,8 @@ def build_frontmatter(
     if date_crawled:
         fm['date_crawled'] = date_crawled
     else:
-        from datetime import datetime
-        fm['date_crawled'] = datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
+        from datetime import datetime, timezone
+        fm['date_crawled'] = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
     if tags:
         fm['tags'] = tags
     if kogol_status is not None:

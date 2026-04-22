@@ -19,7 +19,7 @@ from framework.robots import RobotsChecker
 
 log = logging.getLogger('sources.goryeodogyeong_text')
 
-OUTPUT_DIR = Path(__file__).parent.parent.parent / 'train_data' / 'text_corpus' / 'goryeodogyeong'
+OUTPUT_DIR = Path(__file__).resolve().parent.parent.parent.parent / 'train_data' / 'text_corpus' / 'goryeodogyeong'
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 # Topics to extract from Goryeodogyeong for costume research

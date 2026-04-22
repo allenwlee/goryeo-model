@@ -15,7 +15,7 @@ def detect_encoding(html_bytes: bytes) -> str:
     Use UnicodeDammit to detect the encoding of HTML bytes.
     Falls back through the chain if detection fails.
     """
-    dammit = UnicodeDammit(html_bytes, smart_lines_to_fix=True)
+    dammit = UnicodeDammit(html_bytes)
     detected = dammit.original_encoding
     if detected:
         return detected
