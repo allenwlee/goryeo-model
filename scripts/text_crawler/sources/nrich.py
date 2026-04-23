@@ -38,10 +38,7 @@ GORYEO_SECTIONS = [
 
 
 def extract_file_downloads(soup) -> list[dict]:
-    """Extract file download info from fnSatisfaction2 onclick handlers.
-    
-    Returns list of dicts with keys: download_path, file_idx, menuidx
-    """
+    """Extract file download info from fnSatisfaction2 onclick handlers."""
     results = []
     seen = set()
     for match in re.finditer(
@@ -60,6 +57,11 @@ def extract_file_downloads(soup) -> list[dict]:
                 'menuidx': menuidx,
             })
     return results
+
+
+def _clean_url(url: str) -> str:
+    """Strip whitespace and control chars from a URL."""
+    return re.sub(r'[\n\r\t]', '', url.strip())
 
 
 async def download_nrich_file(fetcher: Fetcher, info: dict, save_dir: Path) -> bool:
@@ -164,10 +166,10 @@ async def crawl():
             for a in soup.find_all('a', href=True):
                 href = a.get('href', '')
                 if 'originalUsrView.do' in href or 'originalUsrDetail' in href:
-                    href = href.replace('&amp;', '&')
+                    href = _clean_url(href)
                     if not href.startswith('http'):
                         href = NRICH_BASE + href
-                    detail_links.append(href.strip())
+                    detail_links.append(href)
 
             log.info(f'NRICH section {menu_idx}: found {len(detail_links)} detail links')
 
