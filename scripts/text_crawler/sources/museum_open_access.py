@@ -113,7 +113,7 @@ async def crawl_cleveland(fetcher: Fetcher, save_dir: Path):
 
     try:
         search_url = 'https://openaccess-api.clevelandart.org/api/artworks'
-        params = {'query': 'Goryeo', 'has_image': 'true'}
+        params = {'q': 'Goryeo', 'has_image': 'true'}
         data = await fetcher.get_json(search_url, params=params)
         artworks = data.get('data', [])
         log.info(f"Cleveland search returned {len(artworks)} results")
@@ -166,125 +166,246 @@ async def crawl_cleveland(fetcher: Fetcher, save_dir: Path):
     log.info(f"Cleveland crawl done: {downloaded} saved")
 
 
-async def crawl_smithsonian(fetcher: Fetcher, save_dir: Path):
-    """Crawl Smithsonian NMAA for Goryeo Korean art via web scraping.
+# Smithsonian S3 bulk data base URL (no auth required)
+# Data is line-delimited JSON organized by unit code (museum/department).
+# Relevant units for Asian/Korean art:
+#   FSG  = Freer/Sackler Galleries (now NMAA - National Museum of Asian Art)
+#   FSA  = National Museum of Asian Art Archives
+# Each unit has 256 index files (~256 records each).
+SMITHSONIAN_S3_BASE = 'https://smithsonian-open-access.s3-us-west-2.amazonaws.com/metadata/edan'
+SMITHSONIAN_UNIT_INDEX = f'{SMITHSONIAN_S3_BASE}/index.txt'
 
-    Note: Smithsonian API (api.si.edu/api/collections/search) may require auth
-    or be deprecated. Falling back to scraping the collections.si.edu search page.
-    If that also fails, log a warning and skip gracefully.
+# Smithsonian API endpoint (requires free API key from https://api.data.gov/signup/)
+SMITHSONIAN_API_BASE = 'https://api.si.edu/openaccess/api/v1.0/search'
+
+
+async def _search_smithsonian_s3(fetcher: Fetcher, unit_code: str, keyword: str, limit: int = 30) -> list[dict]:
+    """Search Smithsonian bulk S3 data for records matching keyword.
+
+    Downloads only the per-unit index file (list of shard URLs), then scans
+    shards in order until ``limit`` matching records are found.
+    Requires no API key. Yields raw record dicts.
+
+    Args:
+        fetcher:   Shared async fetcher with rate-limiting.
+        unit_code: Smithsonian unit code (e.g. 'fsg', 'fsa', 'chndm').
+        keyword:   Search term (case-insensitive).
+        limit:     Maximum number of matching records to return.
+    """
+    import json
+    import httpx
+
+    index_url = f'{SMITHSONIAN_S3_BASE}/{unit_code.lower()}/index.txt'
+    shard_urls: list[str] = []
+    async with httpx.AsyncClient(timeout=30.0, headers={'User-Agent': fetcher.user_agent}) as client:
+        resp = await client.get(index_url)
+        if resp.status_code == 404:
+            log.warning(f"Smithsonian S3: unit code '{unit_code}' not found at {index_url}")
+            return []
+        resp.raise_for_status()
+        shard_urls = [line.strip() for line in resp.text.splitlines() if line.strip()]
+
+    records = []
+    kw_lower = keyword.lower()
+
+    for shard_url in shard_urls:
+        try:
+            async with httpx.AsyncClient(timeout=60.0, headers={'User-Agent': fetcher.user_agent}) as client:
+                resp = await client.get(shard_url)
+                if resp.status_code >= 400:
+                    log.warning(f"Smithsonian S3 shard error {resp.status_code}: {shard_url}")
+                    continue
+                resp.raise_for_status()
+
+            for line in resp.text.splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+
+                rec_type = record.get('type', '')
+                if rec_type not in ('edanmdm',):
+                    continue
+
+                content = record.get('content', {})
+                descriptive = content.get('descriptiveNonRepeating', {})
+
+                # Check rights - only CC0 or public domain
+                online_media = descriptive.get('online_media', {})
+                media_list = online_media.get('media', []) if isinstance(online_media, dict) else []
+
+                img_url = ''
+                rights = ''
+                for m in media_list:
+                    if m.get('type') == 'Images':
+                        usage = m.get('usage', {})
+                        access = (usage.get('access', '') or '') if isinstance(usage, dict) else ''
+                        if access not in ('CC0', 'Public Domain'):
+                            continue
+                        img_url = m.get('content', '') or ''
+                        rights = access
+                        break
+
+                if not img_url:
+                    continue
+
+                # Check title/content for keyword
+                title_obj = descriptive.get('title', {})
+                title_text = (title_obj.get('content', '') or '') if isinstance(title_obj, dict) else str(title_obj or '')
+
+                freetext = content.get('freetext', {})
+                search_text = (
+                    title_text + ' ' +
+                    ' '.join(f.get('content', '') for f in freetext.get('notes', [])) + ' ' +
+                    ' '.join(f.get('content', '') for f in freetext.get('topic', [])) + ' ' +
+                    ' '.join(f.get('content', '') for f in freetext.get('culture', [])) + ' ' +
+                    ' '.join(f.get('content', '') for f in freetext.get('objectType', []))
+                ).lower()
+
+                if kw_lower not in search_text:
+                    continue
+
+                records.append(record)
+                if len(records) >= limit:
+                    return records
+
+        except Exception as e:
+            log.warning(f"Smithsonian S3 shard read error: {e}")
+            continue
+
+    return records
+
+
+async def crawl_smithsonian(
+    fetcher: Fetcher,
+    save_dir: Path,
+    *,
+    smithsonian_api_key: str | None = None,
+):
+    """Crawl Smithsonian NMAA for Goryeo Korean art.
+
+    Supports two data sources (in priority order):
+    1. **Official API** (``smithsonian_api_key`` provided):
+       Uses ``https://api.si.edu/openaccess/api/v1.0/search`` with the
+       registered API key. Requires free registration at https://api.data.gov/signup/
+    2. **S3 bulk data** (no auth needed):
+       Scans publicly accessible line-delimited JSON on AWS S3 at
+       ``s3://smithsonian-open-access/metadata/edan/``. Filters by
+       unit code FSG (Freer/Sackler/NMAA) and keyword 'Goryeo'.
+
+    Args:
+        fetcher:             Shared async fetcher with rate-limiting.
+        save_dir:            Directory to save results.
+        smithsonian_api_key: Optional API key for the official API.
+                             If not provided, falls back to S3 bulk data.
     """
     log.info("Starting Smithsonian NMAA crawl")
+    log.info(f"  API key provided: {bool(smithsonian_api_key)}")
     save_dir.mkdir(parents=True, exist_ok=True)
 
-    # Try Smithsonian collections web search (public, no API key needed)
-    try:
-        search_url = 'https://collections.si.edu/search?q=Goryeo+Korean&searchField=all'
-        response = await fetcher.get(search_url)
-        soup = parse_html_with_fallback(response.content)
-        # Find result items
-        items = soup.find_all('div', class_='qanda-item')
-        log.info(f"Smithsonian web search returned {len(items)} items")
+    downloaded = 0
+    records: list[dict] = []
 
-        downloaded = 0
-        for item in items[:30]:  # Limit to 30 items
-            try:
-                link = item.find('a')
-                if not link:
-                    continue
-                detail_url = link.get('href', '')
-                if not detail_url.startswith('http'):
-                    detail_url = 'https://collections.si.edu' + detail_url
+    if smithsonian_api_key:
+        # ---- Method 1: Official API ----
+        log.info("Smithsonian: using official API (api.si.edu)")
+        try:
+            data = await fetcher.get_json(SMITHSONIAN_API_BASE, params={
+                'q': 'Goryeo',
+                'start': 0,
+                'rows': 50,
+                'sort': 'relevancy',
+                'type': 'edanmdm',
+                'row_group': 'objects',
+                'api_key': smithsonian_api_key,
+            })
+            rows = data.get('response', {}).get('rows', [])
+            log.info(f"Smithsonian API returned {len(rows)} rows")
+            if rows:
+                records = rows
+        except CrawlError as e:
+            log.warning(f"Smithsonian API crawl failed: {e} - falling back to S3 bulk data")
+        except KeyError as e:
+            log.warning(f"Smithsonian API unexpected response format: {e} - falling back to S3 bulk data")
+        except Exception as e:
+            log.warning(f"Smithsonian API error: {e} - falling back to S3 bulk data")
 
-                # Get detail page
-                detail_resp = await fetcher.get(detail_url)
-                detail_soup = parse_html_with_fallback(detail_resp.content)
+    if not records:
+        if smithsonian_api_key:
+            log.info("Smithsonian: API returned no results - trying S3 bulk data")
+        else:
+            log.info("Smithsonian: no API key provided - using S3 bulk data")
+        records = await _search_smithsonian_s3(fetcher, 'fsg', 'Goryeo', limit=30)
 
-                # Extract image
-                img_tag = detail_soup.find('img', class_='viewport-image')
-                img_url = img_tag.get('src', '') if img_tag else ''
+    log.info(f"Smithsonian: processing {len(records)} candidate records")
 
-                title_elem = detail_soup.find('h1') or detail_soup.find('h2')
-                title = title_elem.get_text(strip=True) if title_elem else ''
+    for record in records:
+        try:
+            content = record.get('content', {})
+            descriptive = content.get('descriptiveNonRepeating', {})
+            rec_type = record.get('type', '')
+            unit_code = descriptive.get('unit_code', '') or record.get('unitCode', '') or ''
+            rec_id = str(record.get('id', ''))
 
-                if img_url:
-                    img_bytes = await fetcher.get_binary(img_url)
-                    filename = f"smithsonian_{hash(detail_url)}"
-                    ext = img_url.split('.')[-1].split('?')[0][:4]
-                    if not ext.isalnum():
-                        ext = 'jpg'
-                    img_path = save_dir / f"{filename}.{ext}"
-                    img_path.write_bytes(img_bytes)
-                    downloaded += 1
-            except Exception as e:
-                log.warning(f"Smithsonian item error: {e}")
+            obj_id = f"{unit_code}_{rec_id}" if rec_id else unit_code
+
+            title_obj = descriptive.get('title', {})
+            title = (title_obj.get('content', '') or '') if isinstance(title_obj, dict) else str(title_obj or '')
+
+            online_media = descriptive.get('online_media', {})
+            media_list = online_media.get('media', []) if isinstance(online_media, dict) else []
+            img_url = ''
+            rights = ''
+            for m in media_list:
+                if m.get('type') == 'Images':
+                    usage = m.get('usage', {})
+                    access = (usage.get('access', '') or '') if isinstance(usage, dict) else ''
+                    if access in ('CC0', 'Public Domain'):
+                        img_url = m.get('content', '') or ''
+                        rights = access
+                        break
+
+            if not img_url:
                 continue
 
-        log.info(f"Smithsonian crawl done: {downloaded} saved")
-        return
+            guid = descriptive.get('guid', '') or record.get('guid', '') or ''
+            source_url = guid if guid.startswith('http') else f'https://n2t.net/ark:/{rec_id}'
 
-    except Exception as e:
-        log.warning(f"Smithsonian web search failed: {e} — skipping Smithsonian crawl")
-        return
+            frontmatter = build_frontmatter(
+                source_url=source_url,
+                text_type='museum_object_metadata',
+                language='en',
+                rights_status=rights if rights else 'CC0',
+                title=title,
+                object_id=obj_id,
+                source='Smithsonian NMAA',
+                primary_image_url=img_url,
+                record_type=rec_type,
+                tags=['goryeo', 'korean', 'public-domain', 'smithsonian'],
+            )
 
-    downloaded = 0
-    skipped_rights = 0
+            filename = f"smithsonian_{obj_id}".replace(' ', '_')
+            save_json_corpus_item(save_dir, filename, record, frontmatter)
+            downloaded += 1
 
-    # Old API-based approach (kept as fallback reference)
-    for row in []:
-        content = row.get('content', {})
-        descriptive = content.get('descriptiveNonRepeating', {})
-        obj_id = descriptive.get('unit_code', '') + '_' + str(row.get('id', ''))
+            try:
+                img_bytes = await fetcher.get_binary(img_url)
+                ext = img_url.split('.')[-1].split('?')[0][:4]
+                if not ext.isalnum():
+                    ext = 'jpg'
+                img_path = save_dir / f"{filename}.{ext}"
+                img_path.write_bytes(img_bytes)
+            except Exception as e:
+                log.warning(f"Failed to download Smithsonian image {obj_id}: {e}")
 
-        rights = descriptive.get('rights_information', '') or ''
-        is_public = (
-            'public domain' in rights.lower()
-            or 'cc0' in rights.lower()
-            or 'pd' in rights.lower()
-        )
-        if not is_public:
-            skipped_rights += 1
-            continue
-
-        # Find image URL
-        online_media = content.get('online_media', {})
-        media_list = online_media.get('media', []) if isinstance(online_media, dict) else []
-        img_url = ''
-        for m in media_list:
-            if m.get('type') == 'Images':
-                img_url = m.get('content', '')
-                break
-
-        if not img_url:
-            continue
-
-        frontmatter = build_frontmatter(
-            source_url=f"https://api.si.edu/api/collections/object/{row.get('id', '')}",
-            text_type='museum_object_metadata',
-            language='en',
-            rights_status='Public Domain',
-            title=descriptive.get('title', {}).get('content', ''),
-            object_id=obj_id,
-            source='Smithsonian NMAA',
-            primary_image_url=img_url,
-            rights_info=rights,
-            tags=['goryeo', 'korean', 'public-domain', 'smithsonian'],
-        )
-
-        filename = f"smithsonian_{row.get('id', obj_id)}".replace(' ', '_')
-        save_json_corpus_item(save_dir, filename, row, frontmatter)
-        downloaded += 1
-
-        try:
-            img_bytes = await fetcher.get_binary(img_url)
-            ext = img_url.split('.')[-1].split('?')[0][:4]
-            if not ext.isalnum():
-                ext = 'jpg'
-            img_path = save_dir / f"{filename}.{ext}"
-            img_path.write_bytes(img_bytes)
         except Exception as e:
-            log.warning(f"Failed to download Smithsonian image {obj_id}: {e}")
+            log.warning(f"Smithsonian record processing error: {e}")
+            continue
 
-    log.info(f"Smithsonian crawl done: {downloaded} saved, {skipped_rights} non-public-domain")
+    log.info(f"Smithsonian crawl done: {downloaded} saved")
 
 
 async def crawl():

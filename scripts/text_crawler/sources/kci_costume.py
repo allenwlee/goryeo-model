@@ -78,7 +78,7 @@ async def download_article(fetcher: Fetcher, article_info: dict, save_dir: Path)
     # Extract body text
     text = ''
     figure_captions = []
-    body = soup.find('div', {'id': 'articleBody'}) or soup.find('div', {'class': 'article-body'}) or soup
+    body = soup.find('div', {'class': 'articleBody'}) or soup.find('div', {'class': 'article-body'}) or soup
     if body:
         text = extract_text(body)
         # Extract figure captions
