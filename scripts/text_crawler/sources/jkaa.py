@@ -28,23 +28,56 @@ JKAA_ARTICLE_URLS = [
 
 
 async def find_article_urls(fetcher: Fetcher) -> list[str]:
-    """Crawl JKAA index page to find all costume/Goryeo article URLs."""
-    index_url = 'https://www.ijkaa.org/'
+    """Crawl JKAA archive to find all costume/Goryeo article URLs.
+    
+    Strategy: Crawl /issues/archives -> each volume page -> article URLs.
+    Handles both relative (/v.14/0/73/29) and absolute (https://...) links.
+    """
+    import re
+    base_url = 'https://www.ijkaa.org'
+    archive_url = base_url + '/issues/archives'
+    all_urls = []
+    seen = set()
+    
     try:
-        response = await fetcher.get(index_url)
+        response = await fetcher.get(archive_url)
         soup = parse_html_with_fallback(response.content)
-        # Find all article links with costume/korean keywords
-        urls = []
+        volume_urls = []
         for a in soup.find_all('a', href=True):
             href = a['href']
-            text = a.get_text(strip=True).lower()
-            if any(kw in text for kw in ['costume', 'goryeo', 'korean', 'clothing', 'dress']):
-                if href.startswith('http'):
-                    urls.append(href)
-        return list(set(urls))
+            if re.match(r'^/v\.\d+', href):
+                full = href if href.startswith('http') else base_url + href
+                if full not in seen:
+                    seen.add(full)
+                    volume_urls.append(full)
+        log.info(f"Found {len(volume_urls)} volume pages in JKAA archive")
     except CrawlError as e:
-        log.warning(f"Failed to crawl JKAA index: {e}")
-        return JKAA_ARTICLE_URLS  # Fall back to known URLs
+        log.warning(f"Failed to crawl JKAA archives index: {e}")
+        return JKAA_ARTICLE_URLS
+
+    for vol_url in volume_urls:
+        try:
+            response = await fetcher.get(vol_url)
+            vol_soup = parse_html_with_fallback(response.content)
+            for a in vol_soup.find_all('a', href=True):
+                href = a['href']
+                text = a.get_text(strip=True).lower()
+                if any(kw in text for kw in ['costume', 'goryeo', 'korean', 'clothing', 'dress']) or \
+                   any(kw in href.lower() for kw in ['costume', 'goryeo', 'korean', 'clothing']):
+                    full = href if href.startswith('http') else base_url + href
+                    if full not in seen:
+                        seen.add(full)
+                        all_urls.append(full)
+        except CrawlError as e:
+            log.warning(f"Failed to crawl volume page {vol_url}: {e}")
+            continue
+
+    if not all_urls:
+        log.warning("No article URLs found, falling back to known URLs")
+        return JKAA_ARTICLE_URLS
+
+    log.info(f"Found {len(all_urls)} total article URLs")
+    return all_urls
 
 
 async def download_pdf(fetcher: Fetcher, article_url: str, save_dir: Path) -> bool:

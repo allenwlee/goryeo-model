@@ -112,7 +112,7 @@ async def crawl_cleveland(fetcher: Fetcher, save_dir: Path):
     save_dir.mkdir(parents=True, exist_ok=True)
 
     try:
-        search_url = 'https://openaccess-api.clevelandart.org/api/v1/artworks'
+        search_url = 'https://openaccess-api.clevelandart.org/api/artworks'
         params = {'query': 'Goryeo', 'has_image': 'true'}
         data = await fetcher.get_json(search_url, params=params)
         artworks = data.get('data', [])
