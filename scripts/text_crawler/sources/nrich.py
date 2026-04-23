@@ -167,7 +167,7 @@ async def crawl():
                     href = href.replace('&amp;', '&')
                     if not href.startswith('http'):
                         href = NRICH_BASE + href
-                    detail_links.append(href)
+                    detail_links.append(href.strip())
 
             log.info(f'NRICH section {menu_idx}: found {len(detail_links)} detail links')
 
