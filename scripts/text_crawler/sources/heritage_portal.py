@@ -8,12 +8,12 @@ import logging
 import re
 import sys
 from pathlib import Path
-from urllib.parse import quote
+from urllib.parse import quote, unquote
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from framework.fetcher import Fetcher
 from framework.parser import parse_html_with_fallback, extract_text
-from framework.storage import build_frontmatter, save_text_corpus_item
+from framework.storage import build_frontmatter, save_text_corpus_item, save_json_corpus_item
 from framework.errors import CrawlError
 from framework.robots import RobotsChecker
 
@@ -23,121 +23,178 @@ OUTPUT_DIR = Path(__file__).resolve().parent.parent.parent.parent / 'train_data'
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 HERITAGE_BASE = 'https://www.heritage.go.kr'
-SEARCH_URL = HERITAGE_BASE + '/heri/unified/renewUnifiedList.do'
-SEARCH_TERMS = ['고려', 'Goryeo', '고려시대']
+
+# Goryeo-era shapes code + Korean search terms
+SEARCH_TERMS = ['고려', '고려시대']
+MAX_PAGES = 50  # pagination limit per term
 
 
-def extract_item_links(soup) -> list[str]:
-    """Extract valid HTTP(S) detail page links from a heritage search results page."""
-    links = []
-
-    # Method 1: Extract from goTopPage JS calls - URLs are in the SECOND argument
-    # goTopPage('pageId', '/heri/path/to.do?params', 'handler')
-    for match in re.finditer(r"goTopPage\s*\(\s*'[^']+'\s*,\s*'([^']+\.do[^']*)'", soup.text):
-        href = match.group(1)
-        href = href.replace('&amp;', '&')
-        # Only include if it looks like a real path (not javascript expression)
-        if href.startswith('/heri/') and '.do' in href:
-            if not href.startswith('http'):
-                href = HERITAGE_BASE + href
-            links.append(href)
-
-    # Method 2: Direct <a href> links - only include valid HTTP paths, NOT javascript:
-    for a in soup.find_all('a', href=True):
-        href = a.get('href', '')
-        # Skip javascript:, void, and any non-http(s) schemes
-        if any(href.startswith(s) for s in ['javascript:', 'void:', '#', 'mailto:', 'tel:']):
-            continue
-        # Only include if it's a real path
-        if href.startswith('/heri/') and '.do' in href:
-            href = href.replace('&amp;', '&')
-            if not href.startswith('http'):
-                href = HERITAGE_BASE + href
-            links.append(href)
-
-    # Deduplicate
-    seen = set()
-    unique = []
-    for link in links:
-        clean = link.split(';')[0].split('?')[0].split('#')[0]
-        if clean not in seen:
-            seen.add(clean)
-            unique.append(link)
-    return unique
-
-
-async def crawl_heritage_page(fetcher: Fetcher, page_url: str, save_dir: Path) -> bool:
-    """Crawl a single heritage page."""
-    try:
-        response = await fetcher.get(page_url)
-        soup = parse_html_with_fallback(response.content)
-    except CrawlError as e:
-        log.warning(f"Failed to fetch heritage page {page_url}: {e}")
-        return False
-
-    # Extract title
-    title_elem = soup.find('meta', {'property': 'og:title'}) or soup.find('title')
-    title = title_elem.get('content', title_elem.get_text(strip=True)) if title_elem else page_url
-
-    # Extract main description
-    desc = soup.find('meta', {'property': 'og:description'})
-    description = desc.get('content', '') if desc else ''
-    if not description:
-        content_div = soup.find('div', {'class': 'cont'}) or soup.find('div', {'id': 'content'}) or soup
-        description = extract_text(content_div)[:5000]
-
-    # Extract KOGL status
-    kogl_text = ''
-    for tag in soup.find_all(string=lambda t: t and 'KOGL' in t.upper()):
-        kogl_text += tag.strip() + ' '
-    for badge in soup.find_all(['span', 'div', 'p'], class_=lambda c: c and 'kogl' in c.lower()):
-        kogl_text += badge.get_text(strip=True) + ' '
-
-    kogl_status = None
-    if 'KOGL 1' in kogl_text.upper() or 'CC0' in kogl_text:
-        kogl_status = 1
-    elif 'KOGL 2' in kogl_text.upper():
-        kogl_status = 2
-    elif 'KOGL 3' in kogl_text.upper():
-        kogl_status = 3
-    elif 'KOGL 4' in kogl_text.upper():
-        kogl_status = 4
-
-    # Extract image
-    img_url = ''
-    og_img = soup.find('meta', {'property': 'og:image'})
-    if og_img:
-        img_url = og_img.get('content', '')
-        if img_url and not img_url.startswith('http'):
-            img_url = HERITAGE_BASE + img_url
-
-    frontmatter = build_frontmatter(
-        source_url=page_url,
-        text_type='heritage_site_photo',
-        language='ko',
-        rights_status='KOGL' if kogl_status else 'unknown',
-        kogl_status=kogl_status,
-        title=title,
-        description=description[:500],
-        tags=['heritage', 'goryeo', 'site', 'korean'],
-        kogl_text=kogl_text.strip(),
+def _build_search_url(term: str, page: int = 1) -> str:
+    """Build search URL for a given term and page number."""
+    encoded = quote(term)
+    # shapes=50: 국보 유형 (National Treasure — highest-value Goryeo artifacts)
+    return (
+        f"{HERITAGE_BASE}/heri/unified/renewUnifiedList.do"
+        f"?shapes=50&pageIndex={page}&region=1&query={encoded}&pageNo=1_1_1_1"
     )
 
-    filename = f"heritage_{hash(page_url)}"
+
+def _extract_detail_links(soup) -> list[dict]:
+    """Extract (href, ccbaCpno) pairs from search results.
+    
+    Each search result item has an <a href="/heri/cul/culSelectDetail.do?..."> button.
+    We parse the ccbaCpno from the URL to build the content endpoint.
+    """
+    results = []
+    seen = set()
+    for a in soup.find_all('a', href=True):
+        href = a.get('href', '')
+        if 'culSelectDetail.do' not in href:
+            continue
+        href = href.replace('&amp;', '&').strip()
+        href = re.sub(r'[\n\r\t]', '', href)
+        # Extract ccbaCpno from query string
+        cpno_match = re.search(r'ccbaCpno=(\d+)', href)
+        if not cpno_match:
+            continue
+        ccba_cpno = cpno_match.group(1)
+        if ccba_cpno in seen:
+            continue
+        seen.add(ccba_cpno)
+        results.append({'href': href, 'ccba_cpno': ccba_cpno})
+    return results
+
+
+def _extract_title(soup) -> str:
+    """Extract artifact title from detail page."""
+    og_title = soup.find('meta', {'property': 'og:title'})
+    if og_title:
+        return og_title.get('content', '').strip()
+    title = soup.find('title')
+    return title.get_text(strip=True) if title else 'unknown'
+
+
+def _extract_ccba_cpno(soup) -> str | None:
+    """Extract ccbaCpno from hidden input on detail page."""
+    inp = soup.find('input', {'name': 'ccbaCpno'})
+    return inp.get('value', '') if inp else None
+
+
+async def _fetch_content_html(fetcher: Fetcher, ccba_cpno: str) -> str | None:
+    """Fetch the per-item content page that holds the actual description text.
+    
+    Content URL pattern: /DATA1/heritage/hub_img/html/cul_{ccbaCpno}.html
+    """
+    content_url = f"{HERITAGE_BASE}/DATA1/heritage/hub_img/html/cul_{ccba_cpno}.html"
+    try:
+        response = await fetcher.get(content_url)
+        if response.status_code == 200:
+            return response.text
+    except CrawlError:
+        pass
+    return None
+
+
+async def _fetch_detail_images(fetcher: Fetcher, detail_url: str, soup) -> list[str]:
+    """Extract image URLs from the detail page."""
+    img_urls = []
+    seen = set()
+    # Primary images: thumb URLs from the detail page
+    for img in soup.find_all('img'):
+        src = img.get('src', '')
+        alt = img.get('alt', '')
+        if 'thumb' in src and ('national_treasure' in src or 'unisearch' in src):
+            if src not in seen:
+                seen.add(src)
+                full = src if src.startswith('http') else HERITAGE_BASE + src
+                img_urls.append(full)
+    return img_urls
+
+
+def _extract_content_text(html_content: str) -> str:
+    """Extract artifact description from the content HTML page."""
+    if not html_content:
+        return ''
+    soup = parse_html_with_fallback(html_content.encode() if isinstance(html_content, str) else html_content)
+    # The content div contains the actual description
+    divs = soup.find_all('div')
+    for d in divs:
+        txt = d.get_text(strip=True)
+        if len(txt) > 300:
+            return txt
+    # Fallback: extract all text
+    return extract_text(soup)
+
+
+def _extract_badge(soup) -> str | None:
+    """Extract heritage designation badge (국보, 보물, etc.)."""
+    for badge in soup.find_all(['span', 'strong', 'p', 'div'], class_=lambda c: c and 'badge' in str(c).lower()):
+        txt = badge.get_text(strip=True)
+        if txt:
+            return txt
+    return None
+
+
+async def crawl_heritage_item(
+    fetcher: Fetcher,
+    item: dict,
+    save_dir: Path,
+) -> bool:
+    """Crawl a single heritage item: fetch content page, download text + images."""
+    ccba_cpno = item['ccba_cpno']
+    detail_url = HERITAGE_BASE + item['href']
+
+    try:
+        # Fetch detail page to get page title and images
+        detail_resp = await fetcher.get(detail_url)
+        detail_soup = parse_html_with_fallback(detail_resp.content)
+    except CrawlError as e:
+        log.warning(f"Failed to fetch detail page {detail_url}: {e}")
+        return False
+
+    title = _extract_title(detail_soup)
+    badge = _extract_badge(detail_soup)
+
+    # Fetch the dedicated content page (holds the actual description)
+    content_html = await _fetch_content_html(fetcher, ccba_cpno)
+    description = _extract_content_text(content_html or '')
+
+    if not description or len(description) < 100:
+        log.info(f"No content for ccbaCpno={ccba_cpno}, skipping")
+        return False
+
+    # Get images
+    img_urls = await _fetch_detail_images(fetcher, detail_url, detail_soup)
+
+    frontmatter = build_frontmatter(
+        source_url=detail_url,
+        text_type='heritage_artifact',
+        language='ko',
+        rights_status='unknown',
+        title=title,
+        badge=badge,
+        description=description[:2000],
+        tags=['heritage', 'goryeo', 'artifact', 'korean', 'national_treasure'],
+        ccba_cpno=ccba_cpno,
+    )
+
+    filename = f"heritage_{ccba_cpno}"
     save_text_corpus_item(save_dir, filename, description, frontmatter)
 
-    # Download image
-    if img_url:
+    # Download images
+    for i, img_url in enumerate(img_urls[:10]):
         try:
             img_bytes = await fetcher.get_binary(img_url)
             ext = img_url.split('.')[-1].split('?')[0][:4]
             if not ext.isalnum():
                 ext = 'jpg'
-            img_path = save_dir / f"{filename}.{ext}"
+            img_path = save_dir / f"{filename}_img{i}.{ext}"
             img_path.write_bytes(img_bytes)
+            log.info(f"  Downloaded image {i}: {img_url.split('/')[-1][:40]}")
         except Exception as e:
-            log.warning(f"Failed to download heritage image: {e}")
+            log.warning(f"  Failed to download {img_url}: {e}")
 
+    log.info(f"Heritage item {ccba_cpno}: {title[:50]} ({len(description)} chars, {len(img_urls)} imgs)")
     return True
 
 
@@ -145,25 +202,41 @@ async def crawl():
     fetcher = Fetcher(requests_per_second=0.5)
 
     crawled = 0
+    skipped = 0
+
     for term in SEARCH_TERMS:
-        encoded_term = quote(term)
-        search_url = f"{SEARCH_URL}?shapes=0&pageIndex=1&region=1&query={encoded_term}&pageNo=1_1_1_1"
+        log.info(f"Heritage search: '{term}'")
+        seen_items = set()
 
-        try:
-            response = await fetcher.get(search_url)
-            soup = parse_html_with_fallback(response.content)
+        for page in range(1, MAX_PAGES + 1):
+            search_url = _build_search_url(term, page)
+            try:
+                response = await fetcher.get(search_url)
+                soup = parse_html_with_fallback(response.content)
 
-            links = extract_item_links(soup)
-            log.info(f"Heritage '{term}': found {len(links)} item links")
+                items = _extract_detail_links(soup)
+                if not items:
+                    break  # No more results on this page
 
-            for link in links[:30]:
-                if await crawl_heritage_page(fetcher, link, OUTPUT_DIR):
-                    crawled += 1
+                log.info(f"  Page {page}: found {len(items)} items (cumulative seen: {len(seen_items)})")
 
-        except CrawlError as e:
-            log.warning(f"Heritage search failed for '{term}': {e}")
+                for item in items:
+                    ccba_cpno = item['ccba_cpno']
+                    if ccba_cpno in seen_items:
+                        continue
+                    seen_items.add(ccba_cpno)
 
-    log.info(f"Heritage Portal crawl done: {crawled} pages")
+                    ok = await crawl_heritage_item(fetcher, item, OUTPUT_DIR)
+                    if ok:
+                        crawled += 1
+                    else:
+                        skipped += 1
+
+            except CrawlError as e:
+                log.warning(f"  Page {page} failed for '{term}': {e}")
+                continue
+
+    log.info(f"Heritage Portal crawl done: {crawled} items, {skipped} skipped")
 
 
 if __name__ == '__main__':
