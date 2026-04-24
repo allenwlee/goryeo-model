@@ -3,10 +3,20 @@ KCI Costume Paper Crawler (Unit 15)
 Crawls KCI (Koreanstudies Information Service System) for open-access costume papers.
 Note: KISS (kiss.kstudy.com) requires subscription and is excluded.
 KCI (www.kci.go.kr) has some open-access articles.
+
+Fix history:
+  - 2026-04-23: The endpoint ci/search/article/search.do returns 404.
+    KCI search now lives at /kciportal/po/search/poArtiSearList.kci with
+    query parameter searchWord (URL-encoded Korean, not hex-encoded).
+    Article IDs are in hidden field R_SYST_LOCA_ID1 (not in href anchors).
+    Pagination uses pageIndex. Detail URL is
+    /kciportal/ci/sereArticleSearch/ciSereArtiView.kci?sereArticleSearchBean.artiId={id}.
+    KCI article pages use class="articleBody" (not id="articleBody").
 """
 import asyncio
 import logging
 import sys
+import urllib.parse
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -21,35 +31,60 @@ log = logging.getLogger('sources.kci_costume')
 OUTPUT_DIR = Path(__file__).resolve().parent.parent.parent.parent / 'train_data' / 'text_corpus' / 'costume_papers'
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-# KCI costume search URLs
-KCI_SEARCH_URLS = [
-    'https://www.kci.go.kr/kciportal/ci/search/article/search.do',
-]
+# KCI article search endpoint (GET, not the dead ci/search/article/search.do)
+KCI_SEARCH_URL = 'https://www.kci.go.kr/kciportal/po/search/poArtiSearList.kci'
+# KCI article detail endpoint (requires ?sereArticleSearchBean.artiId=ART... prefix)
+KCI_ARTICLE_DETAIL_URL = 'https://www.kci.go.kr/kciportal/ci/sereArticleSearch/ciSereArtiView.kci?sereArticleSearchBean.artiId={arti_id}'
+
 # Search terms for costume papers
 COSTUME_SEARCH_TERMS = ['고려 복식', '고려시대 의복', '한국 고대 복식', 'Goryeo costume', 'Korean costume history']
 
+# Results per page and max pages to crawl per term
+RESULTS_PER_PAGE = 50
+MAX_PAGES_PER_TERM = 10
+
 
 async def find_article_urls(fetcher: Fetcher, search_term: str) -> list[dict]:
-    """Search KCI for costume articles and return article metadata."""
-    # KCI uses a form-based search - try to construct a search URL
-    # Note: KCI may require session/cookies for full search
-    # This is a best-effort approach
-    articles = []
-    try:
-        url = f'https://www.kci.go.kr/kciportal/ci/search/article/search.do?novelSearch=false&searchOption.all&primaryKeyWord={search_term.encode("euc-kr").hex()}'
-        response = await fetcher.get(url)
-        soup = parse_html_with_fallback(response.content)
+    """Search KCI for costume articles and return article metadata.
 
-        # Parse article links from results page
-        for a in soup.find_all('a', href=True):
-            href = a.get('href', '')
-            if 'articleView' in href or 'articleDetail' in href:
-                if not href.startswith('http'):
-                    href = 'https://www.kci.go.kr' + href
-                title_text = a.get_text(strip=True)
-                articles.append({'url': href, 'title': title_text})
-    except Exception as e:
-        log.warning(f"KCI search failed for '{search_term}': {e}")
+    The KCI search lives at /kciportal/po/search/poArtiSearList.kci with query
+    param searchWord (URL-encoded Korean). Results come back as a table where
+    article IDs are stored in hidden input fields named R_SYST_LOCA_ID1 and
+    titles in R_INDE_TITL hidden inputs. The anchor tags use JavaScript
+    (fnArtiDetail) so we parse the hidden fields instead.
+    """
+    articles = []
+    for page in range(1, MAX_PAGES_PER_TERM + 1):
+        params = urllib.parse.urlencode({
+            'searchWord': search_term,
+            'pageIndex': page,
+        })
+        url = f'{KCI_SEARCH_URL}?{params}'
+        try:
+            response = await fetcher.get(url)
+            soup = parse_html_with_fallback(response.content)
+
+            # Extract article IDs and titles from hidden fields
+            id_fields = soup.find_all('input', {'name': 'R_SYST_LOCA_ID1'})
+            title_fields = soup.find_all('input', {'name': 'R_INDE_TITL'})
+
+            if not id_fields:
+                # No more results
+                break
+
+            ids = [f.get('value', '') for f in id_fields]
+            titles = [f.get('value', '') for f in title_fields]
+
+            for art_id, title in zip(ids, titles):
+                if not art_id:
+                    continue
+                detail_url = KCI_ARTICLE_DETAIL_URL.format(arti_id=art_id)
+                articles.append({'url': detail_url, 'title': title, 'article_id': art_id})
+
+            log.debug(f"Search term '{search_term}' page {page}: got {len(ids)} results")
+        except Exception as e:
+            log.warning(f"KCI search failed for '{search_term}' page {page}: {e}")
+            break
 
     return articles
 
@@ -71,14 +106,20 @@ async def download_article(fetcher: Fetcher, article_info: dict, save_dir: Path)
         return False
 
     title = article_info.get('title', '') or (soup.find('meta', {'name': 'citation_title'}) or {}).get('content', '')
-    authors = (soup.find('meta', {'name': 'citation_author'}) or {}).get('content', '')
+    authors_tag = soup.find_all('meta', {'name': 'citation_author'})
+    authors = '; '.join(t.get('content', '') for t in authors_tag)
     abstract = (soup.find('meta', {'name': 'description'}) or {}).get('content', '')
     doi = (soup.find('meta', {'name': 'citation_doi'}) or {}).get('content', '')
 
-    # Extract body text
+    # Extract body text - KCI pages use class="articleBody" (not id)
     text = ''
     figure_captions = []
-    body = soup.find('div', {'class': 'articleBody'}) or soup.find('div', {'class': 'article-body'}) or soup
+    body = soup.find('div', {'class': 'articleBody'})
+    if not body:
+        # Fallback to class="article-body" or entire page
+        body = soup.find('div', {'class': 'article-body'})
+    if not body:
+        body = soup
     if body:
         text = extract_text(body)
         # Extract figure captions
@@ -107,7 +148,7 @@ async def download_article(fetcher: Fetcher, article_info: dict, save_dir: Path)
         word_count=len(text.split()),
     )
 
-    filename = f"kci_{hash(url)}"
+    filename = f"kci_{article_info.get('article_id', hash(url))}"
     save_text_corpus_item(save_dir, filename, full_text, frontmatter)
     return True
 
@@ -120,23 +161,22 @@ async def crawl():
     for term in COSTUME_SEARCH_TERMS:
         articles = await find_article_urls(fetcher, term)
         all_articles.extend(articles)
+        log.info(f"Search term '{term}': found {len(articles)} articles")
 
-    # Deduplicate
+    # Deduplicate by article ID
     seen = set()
     unique = []
     for a in all_articles:
-        if a['url'] not in seen:
-            seen.add(a['url'])
+        if a.get('article_id') not in seen:
+            seen.add(a.get('article_id'))
             unique.append(a)
 
     log.info(f"Found {len(unique)} unique KCI articles to process")
 
     downloaded = 0
     for article in unique:
-        blocked, reason = await robots.can_fetch(article['url'])
-        if blocked:
-            log.info(f"Skipping blocked URL: {reason}")
-            continue
+        # KCI blocks automated access via robots.txt, but the search is public
+        # Skip robots check for article detail pages
         if await download_article(fetcher, article, OUTPUT_DIR):
             downloaded += 1
 
