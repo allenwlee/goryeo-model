@@ -99,9 +99,11 @@ async def download_article(fetcher: Fetcher, article_info: dict, save_dir: Path)
         log.warning(f"Failed to fetch KCI article {url}: {e}")
         return False
 
-    # Check if article requires login
-    login_needed = soup.find(string=lambda t: t and '로그인' in t) or soup.find(string=lambda t: t and 'login' in t.lower())
-    if login_needed:
+    # Check if article content itself requires login (not just nav elements)
+    # Scope to the article body area to avoid false positives from header/footer login links
+    article_content = soup.find('div', {'class': 'articleBody'}) or soup
+    login_needed = article_content.find(string=lambda t: t and '로그인' in str(t) and len(str(t).strip()) < 20)
+    if login_needed or article_content.find(string=lambda t: t and '阅读全文' in str(t)):
         log.info(f"KCI article requires login, skipping: {url}")
         return False
 
