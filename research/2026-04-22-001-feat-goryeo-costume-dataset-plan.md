@@ -51,7 +51,7 @@ The model needs to learn Goryeo-specific visual patterns that are nearly absent 
 
 ## Key Decisions
 
-- **Primary drama target: 고려거란전쟁 (A-, KBS2 2023-24)** — highest-rated Goryeo costume accuracy; Mongolian academy consultation; academic praise for costume reconstruction
+- **Primary drama target: 고려거란전쟁 (A-, KBS2 2023-24)** — highest-rated Goryeo costume accuracy; professor 임용한 ( history) consulted for period accuracy; academic praise for costume reconstruction; namu.wiki "역사 탐구" page documents historical accuracy analysis
 - **Secondary drama: 무인시대 (B+, KBS1 2003-04)** — best early-2000s Goryeo accuracy; covers late Goryeo military regime period (1170–1219) — closest to 1218 screenplay setting
 - **Caption format: weighted keyword syntax** — `(keyword:1.2)` emphasis in LoRA training, standard negative caption format for exclusions
 - **Reference resolution: 768×768** — balances SDXL compatibility with portrait orientation of drama frames
@@ -260,7 +260,7 @@ Drama episodes (owned, private use)
 
 - **Research summary**: `research/2026-04-21-goryeo-costume-ai-research-summary.md`
 - **Deep research report**: `research/deep-research-report goryeo chatgpt.md`
-- **Graded drama ratings source**: KCI academic database, 나무위키 (namu.wiki), Daum news articles
+- **Graded drama ratings source**: KCI academic database, 나무위키 (namu.wiki) "역사 탐구" page, Daum news articles
 - **Caption format reference**: Kohya SS documentation
 - **Goryeo-Song costume scholarship**: JKAA, 고려거란전쟁 costume director 이석근 interviews
 - **Korean costume terminology**: AKS EncyKorea / KOSTMA (encykorea.aks.ac.kr)
